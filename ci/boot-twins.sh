@@ -13,6 +13,18 @@ DEV=${PK:+/dev/$PK}; [ -b "${DEV:-}" ] || DEV=none   # io.max needs the whole di
 echo "io cap device: $DEV (root on $PART)"
 names=(twina twinb twinc twind)
 docker volume create twinci-sqfs >/dev/null
+# Pre-seeded /etc/passwd (A/B fleet, non-root arm): the tv container is
+# read_only and its /etc/passwd is the frozen 2011 base file with no app
+# users, so every jailed Java app aborts at System.<clinit> (getpwuid_r
+# fails -> SIGSEGV rc=139). Extract the image's base file once, then per
+# twin append the app-UID range 5000-9999 (gid 5000, group jailer) and
+# bind-mount it over /etc/passwd. UIDs are allocated per install and cannot
+# be predicted per app, but the range is known (seen: 5141, 5222, 6042,
+# 7010, 7779). Mounted :rw so a boot-time write to /etc/passwd cannot fail
+# the boot; the file is runner-local and discarded with the run.
+id=$(docker create tvtwin-tv /x); docker cp "$id:/etc/passwd" "$W/passwd-base"; docker rm "$id" >/dev/null
+grep -q '^root:' "$W/passwd-base" || { echo "passwd-base has no root entry" >&2; exit 1; }
+echo "passwd-base: $(wc -c < "$W/passwd-base") bytes, $(wc -l < "$W/passwd-base") lines"
 for i in $(seq 0 $((N-1))); do
   T=${names[$i]}; P=$((47881+i)); D=$W/$T
   # per-twin runtime (v4): twinb uses runtime2 when given, all others use runtime
@@ -28,6 +40,26 @@ for i in $(seq 0 $((N-1))); do
   rm -f .work/compose.io.yaml
   # rootful docker on the runner applies AppArmor docker-default, which blocks mount(2) even with SYS_ADMIN (Oracle runs rootless docker without AppArmor)
   sed -i "s#      - seccomp=#      - apparmor=unconfined\n      - seccomp=#" compose.yaml
+  python3 - "$W/passwd-base" "$D/passwd" <<'EOF'
+import sys
+base = open(sys.argv[1]).read()
+assert base.endswith("\n")
+lines = [base]
+for uid in range(5000, 10000):
+    lines.append("app%d:x:%d:5000::/:/bin/false\n" % (uid, uid))
+open(sys.argv[2], "w").write("".join(lines))
+EOF
+  echo "$T passwd: $(wc -l < "$D/passwd") lines"
+  python3 - <<'EOF'
+import sys
+p = "compose.yaml"
+s = open(p).read()
+anchor = "      - ${TVTWIN_RUN:-./.work/run}/meminfo:/proc/meminfo"
+assert s.count(anchor) == 1, "meminfo volume line not found exactly once"
+s = s.replace(anchor, "      - ./passwd:/etc/passwd:rw\n" + anchor)
+open(p, "w").write(s)
+EOF
+  grep -n "passwd" compose.yaml
   if [ -n "$TRT" ]; then  # test image: 64-bit under the entry name the Oracle fix64 scripts use
     cp "$TRT" image/$E.sqfs
     python3 - "$(sha256sum image/$E.sqfs | cut -d' ' -f1)" "$E" <<'EOF'
@@ -94,6 +126,8 @@ for i in $(seq 0 $((N-1))); do
   make up IO_DEV=$DEV 2>&1 | tail -4
   docker exec $T-tv sh -c 'grep -q " /media/developer/webosatl/runtime " /proc/mounts || sh /media/developer/webosatl/bin/init.sh mount' 2>&1 | tail -8
   docker exec $T-tv sh -c 'ls /media/developer/webosatl/runtime/AppRun && grep " /media/developer/webosatl/runtime" /proc/mounts' 2>&1 | sed "s/^/$T runtime: /"
+  # pre-seed check: the bind-mounted passwd must resolve across the whole app-UID range
+  docker exec $T-tv sh -c 'getent passwd 5000; getent passwd 6042; getent passwd 9999' 2>&1 | sed "s/^/$T passwd: /"
   docker update --cpus "$CPUS" $T-tv >/dev/null
   docker update --cpus 0.25 $T-harness >/dev/null
 done
